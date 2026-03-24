@@ -178,15 +178,14 @@ impl TipJarContract {
 
         sender.require_auth();
 
-        let token_id = Self::read_token(&env);
-        let token_client = token::Client::new(&env, &token_id);
+        let token_client = token::Client::new(&env, &Self::read_token(&env));
         let contract_address = env.current_contract_address();
 
         token_client.transfer(&sender, &contract_address, &amount);
 
-        let creator_balance_key = DataKey::CreatorBalance(creator.clone());
-        let creator_total_key = DataKey::CreatorTotal(creator.clone());
-        let creator_msgs_key = DataKey::CreatorMessages(creator.clone());
+        let balance_key = DataKey::CreatorBalance(creator.clone());
+        let total_key = DataKey::CreatorTotal(creator.clone());
+        let msgs_key = DataKey::CreatorMessages(creator.clone());
 
         let current_balance: i128 = env.storage().persistent().get(&creator_balance_key).unwrap_or(0);
         let current_total: i128 = env.storage().persistent().get(&creator_total_key).unwrap_or(0);
@@ -206,10 +205,10 @@ impl TipJarContract {
         let mut messages: Vec<TipWithMessage> = env
             .storage()
             .persistent()
-            .get(&creator_msgs_key)
+            .get(&msgs_key)
             .unwrap_or_else(|| Vec::new(&env));
         messages.push_back(payload);
-        env.storage().persistent().set(&creator_msgs_key, &messages);
+        env.storage().persistent().set(&msgs_key, &messages);
 
         env.events().publish(
             (symbol_short!("tip_msg"), creator.clone()),
@@ -386,7 +385,7 @@ mod tests {
         let tipjar_client = TipJarContractClient::new(&env, &contract_id);
         let token_client = token::Client::new(&env, &token_id);
         let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
-        let sender = Address::generate(&env);
+        let subscriber = Address::generate(&env);
         let creator = Address::generate(&env);
         let treasury = Address::generate(&env);
 
