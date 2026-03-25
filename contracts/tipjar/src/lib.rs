@@ -39,6 +39,29 @@ pub struct BatchTip {
     pub amount: i128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TimePeriod {
+    AllTime,
+    Monthly,
+    Weekly,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaderboardEntry {
+    pub address: Address,
+    pub total_amount: i128,
+    pub tip_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParticipantKind {
+    Tipper,
+    Creator,
+}
+
 /// Role enum for role-based access control.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +97,14 @@ pub enum DataKey {
     UserRole(Address),
     /// Maps a Role to the set of addresses holding it (persistent).
     RoleMembers(Role),
+    /// Aggregate stats for a tipper in a specific time bucket (bucket_id: 0=AllTime, YYYYMM=Monthly, YYYYWW=Weekly).
+    TipperAggregate(Address, u32),
+    /// Aggregate stats for a creator in a specific time bucket.
+    CreatorAggregate(Address, u32),
+    /// Ordered list of all known tipper addresses for a bucket.
+    TipperParticipants(u32),
+    /// Ordered list of all known creator addresses for a bucket.
+    CreatorParticipants(u32),
 }
 
 #[contracterror]
@@ -160,7 +191,9 @@ impl TipJarContract {
 
         // Event topics: ("tip", creator, token). Event data: (sender, amount).
         env.events()
-            .publish((symbol_short!("tip"), creator, token), (sender, amount));
+            .publish((symbol_short!("tip"), creator.clone(), token), (sender.clone(), amount));
+
+        update_leaderboard_aggregates(&env, &sender, &creator, amount);
     }
 
     /// Allows supporters to attach a note and metadata to a tip.
@@ -222,8 +255,10 @@ impl TipJarContract {
 
         env.events().publish(
             (symbol_short!("tip_msg"), creator.clone()),
-            (sender, amount, message, metadata),
+            (sender.clone(), amount, message, metadata),
         );
+
+        update_leaderboard_aggregates(&env, &sender, &creator, amount);
     }
 
     /// Returns total historical tips for a creator for a specific token.
@@ -385,6 +420,20 @@ impl TipJarContract {
 
         results
     }
+
+    /// Returns a ranked page of top tippers for the given time period.
+    /// No auth required; available even when the contract is paused.
+    pub fn get_top_tippers(env: Env, period: TimePeriod, offset: u32, limit: u32) -> Vec<LeaderboardEntry> {
+        let bucket = bucket_id_for_period(&env, &period);
+        ranked_page(&env, DataKey::TipperParticipants(bucket), true, bucket, offset, limit)
+    }
+
+    /// Returns a ranked page of top creators for the given time period.
+    /// No auth required; available even when the contract is paused.
+    pub fn get_top_creators(env: Env, period: TimePeriod, offset: u32, limit: u32) -> Vec<LeaderboardEntry> {
+        let bucket = bucket_id_for_period(&env, &period);
+        ranked_page(&env, DataKey::CreatorParticipants(bucket), false, bucket, offset, limit)
+    }
 }
 
 /// Shared write path for granting a role. Used by `grant_role` and `init`.
@@ -491,7 +540,67 @@ fn process_single_tip(env: &Env, sender: &Address, entry: &BatchTip) -> Result<(
         (sender.clone(), entry.amount),
     );
 
+    update_leaderboard_aggregates(env, sender, &entry.creator, entry.amount);
+
     Ok(())
+}
+
+/// Registers `addr` in the participant list stored under `key` if not already present.
+/// Loads `Vec<Address>` from persistent storage, appends `addr` only if absent, writes back.
+fn register_participant(env: &Env, key: DataKey, addr: &Address) {
+    let mut participants: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    let already_present = participants.iter().any(|a| a == *addr);
+    if !already_present {
+        participants.push_back(addr.clone());
+        env.storage().persistent().set(&key, &participants);
+    }
+}
+
+/// Updates tipper and creator leaderboard aggregates for a single tip.
+/// Called from `tip`, `tip_with_message`, and `process_single_tip` (on Ok path).
+fn update_leaderboard_aggregates(env: &Env, tipper: &Address, creator: &Address, amount: i128) {
+    let periods = [TimePeriod::AllTime, TimePeriod::Monthly, TimePeriod::Weekly];
+
+    for period in periods.iter() {
+        let bucket = bucket_id_for_period(env, period);
+
+        // Update tipper aggregate
+        let tipper_key = DataKey::TipperAggregate(tipper.clone(), bucket);
+        let mut tipper_entry: LeaderboardEntry = env
+            .storage()
+            .persistent()
+            .get(&tipper_key)
+            .unwrap_or(LeaderboardEntry {
+                address: tipper.clone(),
+                total_amount: 0,
+                tip_count: 0,
+            });
+        tipper_entry.total_amount += amount;
+        tipper_entry.tip_count += 1;
+        env.storage().persistent().set(&tipper_key, &tipper_entry);
+        register_participant(env, DataKey::TipperParticipants(bucket), tipper);
+
+        // Update creator aggregate
+        let creator_key = DataKey::CreatorAggregate(creator.clone(), bucket);
+        let mut creator_entry: LeaderboardEntry = env
+            .storage()
+            .persistent()
+            .get(&creator_key)
+            .unwrap_or(LeaderboardEntry {
+                address: creator.clone(),
+                total_amount: 0,
+                tip_count: 0,
+            });
+        creator_entry.total_amount += amount;
+        creator_entry.tip_count += 1;
+        env.storage().persistent().set(&creator_key, &creator_entry);
+        register_participant(env, DataKey::CreatorParticipants(bucket), creator);
+    }
 }
 
 /// Panics with `TipJarError::Unauthorized` unless `addr` holds at least one role in `roles`.
@@ -509,6 +618,152 @@ fn require_any_role(env: &Env, addr: &Address, roles: &[Role]) {
     if !has_any {
         panic_with_error!(env, TipJarError::Unauthorized);
     }
+}
+
+/// Returns the bucket_id for the given period at the current ledger timestamp.
+/// - AllTime → 0u32
+/// - Monthly → year * 100 + month  (e.g. 202507 for July 2025)
+/// - Weekly  → iso_year * 100 + iso_week (e.g. 202528 for week 28 of 2025)
+///
+/// All arithmetic is integer-only (no_std compatible, no floats).
+fn bucket_id_for_period(env: &Env, period: &TimePeriod) -> u32 {
+    match period {
+        TimePeriod::AllTime => 0u32,
+        TimePeriod::Monthly => {
+            let ts = env.ledger().timestamp(); // Unix seconds (u64)
+            let days = (ts / 86400) as i64;
+            // Proleptic Gregorian calendar from days since Unix epoch (1970-01-01)
+            let z = days + 719468i64;
+            let era = if z >= 0 { z } else { z - 146096 } / 146097;
+            let doe = z - era * 146097;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            let y = yoe + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let month = mp + if mp < 10 { 3 } else { -9 };
+            let year = y + if month <= 2 { 1 } else { 0 };
+            (year * 100 + month) as u32
+        }
+        TimePeriod::Weekly => {
+            let ts = env.ledger().timestamp();
+            let days = (ts / 86400) as i64;
+            // Day of week: 0=Mon, 6=Sun (Unix epoch 1970-01-01 was a Thursday = 3)
+            let dow = (days + 3).rem_euclid(7); // 0=Mon..6=Sun
+            // ISO week date: find the Thursday of the current week
+            let thursday = days + (3 - dow);
+            // Year of that Thursday (proleptic Gregorian)
+            let z = thursday + 719468i64;
+            let era = if z >= 0 { z } else { z - 146096 } / 146097;
+            let doe = z - era * 146097;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            let iso_year = yoe + era * 400;
+            // Day of year for Jan 4 of iso_year (always in week 1)
+            // ISO week number: (doy_of_thursday - doy_of_jan4_thursday) / 7 + 1
+            // Simpler: week = (day_of_year_of_thursday + 10) / 7  where doy is 1-based
+            // Use: week = (doy_of_thursday + 10) / 7  where doy is 0-based
+            let doy_thu = doe - (365 * yoe + yoe / 4 - yoe / 100); // 0-based
+            let iso_week = (doy_thu + 10) / 7;
+            (iso_year * 100 + iso_week) as u32
+        }
+    }
+}
+
+/// Loads all participant aggregates for a given bucket, sorts descending by
+/// `(total_amount, tip_count)`, and returns the requested page slice.
+///
+/// - `participants_key`: storage key for the `Vec<Address>` participant list
+/// - `is_tipper`: if true, loads `TipperAggregate`; otherwise `CreatorAggregate`
+/// - `bucket`: the time-period bucket id
+/// - `offset` / `limit`: pagination parameters (limit capped at 100)
+fn ranked_page(
+    env: &Env,
+    participants_key: DataKey,
+    is_tipper: bool,
+    bucket: u32,
+    offset: u32,
+    limit: u32,
+) -> Vec<LeaderboardEntry> {
+    // 1. Zero limit → empty immediately
+    if limit == 0 {
+        return Vec::new(env);
+    }
+
+    // 2. Load participant list
+    let participants: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&participants_key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    let total = participants.len();
+
+    // 3. Empty list or offset past end → empty
+    if total == 0 || offset >= total {
+        return Vec::new(env);
+    }
+
+    // 4. Build a soroban Vec of LeaderboardEntry values
+    let mut entries: Vec<LeaderboardEntry> = Vec::new(env);
+    for addr in participants.iter() {
+        let agg_key = if is_tipper {
+            DataKey::TipperAggregate(addr.clone(), bucket)
+        } else {
+            DataKey::CreatorAggregate(addr.clone(), bucket)
+        };
+        let entry: LeaderboardEntry = env
+            .storage()
+            .persistent()
+            .get(&agg_key)
+            .unwrap_or(LeaderboardEntry {
+                address: addr.clone(),
+                total_amount: 0,
+                tip_count: 0,
+            });
+        entries.push_back(entry);
+    }
+
+    // 5. Selection sort descending by (total_amount, tip_count)
+    let n = entries.len();
+    let mut i = 0u32;
+    while i < n {
+        let mut best = i;
+        let mut j = i + 1;
+        while j < n {
+            let a = entries.get(best).unwrap();
+            let b = entries.get(j).unwrap();
+            if b.total_amount > a.total_amount
+                || (b.total_amount == a.total_amount && b.tip_count > a.tip_count)
+            {
+                best = j;
+            }
+            j += 1;
+        }
+        if best != i {
+            let tmp_i = entries.get(i).unwrap();
+            let tmp_best = entries.get(best).unwrap();
+            entries.set(i, tmp_best);
+            entries.set(best, tmp_i);
+        }
+        i += 1;
+    }
+
+    // 6. Clamp limit to 100
+    let effective_limit = if limit > 100 { 100 } else { limit };
+
+    // 7. Slice [offset .. offset + effective_limit]
+    let end = {
+        let candidate = offset + effective_limit;
+        if candidate > total { total } else { candidate }
+    };
+
+    let mut result: Vec<LeaderboardEntry> = Vec::new(env);
+    let mut idx = offset;
+    while idx < end {
+        result.push_back(entries.get(idx).unwrap());
+        idx += 1;
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -1194,5 +1449,247 @@ mod tests {
             single_topics, batch_topics,
             "event topics (\"tip\", creator, token) should match"
         );
+    }
+
+    // ── Task 8.1: Integration and tiebreaker tests ────────────────────────────
+
+    #[test]
+    fn test_leaderboard_tip_updates_all_periods() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        token_admin.mint(&sender, &1_000);
+        client.tip(&sender, &creator, &token_id, &200);
+
+        // AllTime tipper
+        let tippers_all = client.get_top_tippers(&TimePeriod::AllTime, &0, &10);
+        assert_eq!(tippers_all.len(), 1);
+        assert_eq!(tippers_all.get(0).unwrap().total_amount, 200);
+        assert_eq!(tippers_all.get(0).unwrap().tip_count, 1);
+
+        // AllTime creator
+        let creators_all = client.get_top_creators(&TimePeriod::AllTime, &0, &10);
+        assert_eq!(creators_all.len(), 1);
+        assert_eq!(creators_all.get(0).unwrap().total_amount, 200);
+        assert_eq!(creators_all.get(0).unwrap().tip_count, 1);
+
+        // Monthly tipper
+        let tippers_monthly = client.get_top_tippers(&TimePeriod::Monthly, &0, &10);
+        assert_eq!(tippers_monthly.len(), 1);
+        assert_eq!(tippers_monthly.get(0).unwrap().total_amount, 200);
+        assert_eq!(tippers_monthly.get(0).unwrap().tip_count, 1);
+
+        // Monthly creator
+        let creators_monthly = client.get_top_creators(&TimePeriod::Monthly, &0, &10);
+        assert_eq!(creators_monthly.len(), 1);
+        assert_eq!(creators_monthly.get(0).unwrap().total_amount, 200);
+        assert_eq!(creators_monthly.get(0).unwrap().tip_count, 1);
+
+        // Weekly tipper
+        let tippers_weekly = client.get_top_tippers(&TimePeriod::Weekly, &0, &10);
+        assert_eq!(tippers_weekly.len(), 1);
+        assert_eq!(tippers_weekly.get(0).unwrap().total_amount, 200);
+        assert_eq!(tippers_weekly.get(0).unwrap().tip_count, 1);
+
+        // Weekly creator
+        let creators_weekly = client.get_top_creators(&TimePeriod::Weekly, &0, &10);
+        assert_eq!(creators_weekly.len(), 1);
+        assert_eq!(creators_weekly.get(0).unwrap().total_amount, 200);
+        assert_eq!(creators_weekly.get(0).unwrap().tip_count, 1);
+    }
+
+    #[test]
+    fn test_leaderboard_tip_with_message_updates_aggregates() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        token_admin.mint(&sender, &1_000);
+
+        let message = soroban_sdk::String::from_str(&env, "hello");
+        let metadata = soroban_sdk::Map::new(&env);
+        client.tip_with_message(&sender, &creator, &token_id, &150, &message, &metadata);
+
+        // AllTime tipper
+        let tippers = client.get_top_tippers(&TimePeriod::AllTime, &0, &10);
+        assert_eq!(tippers.len(), 1);
+        assert_eq!(tippers.get(0).unwrap().total_amount, 150);
+        assert_eq!(tippers.get(0).unwrap().tip_count, 1);
+
+        // AllTime creator
+        let creators = client.get_top_creators(&TimePeriod::AllTime, &0, &10);
+        assert_eq!(creators.len(), 1);
+        assert_eq!(creators.get(0).unwrap().total_amount, 150);
+        assert_eq!(creators.get(0).unwrap().tip_count, 1);
+    }
+
+    #[test]
+    fn test_leaderboard_tip_batch_successful_entry_updates_aggregates() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        token_admin.mint(&sender, &1_000);
+
+        let mut tips: soroban_sdk::Vec<BatchTip> = soroban_sdk::Vec::new(&env);
+        tips.push_back(BatchTip {
+            creator: creator.clone(),
+            token: token_id.clone(),
+            amount: 300,
+        });
+        let results = client.tip_batch(&sender, &tips);
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+
+        let tippers = client.get_top_tippers(&TimePeriod::AllTime, &0, &10);
+        assert_eq!(tippers.len(), 1);
+        assert_eq!(tippers.get(0).unwrap().total_amount, 300);
+        assert_eq!(tippers.get(0).unwrap().tip_count, 1);
+
+        let creators = client.get_top_creators(&TimePeriod::AllTime, &0, &10);
+        assert_eq!(creators.len(), 1);
+        assert_eq!(creators.get(0).unwrap().total_amount, 300);
+        assert_eq!(creators.get(0).unwrap().tip_count, 1);
+    }
+
+    #[test]
+    fn test_leaderboard_tip_batch_failed_entry_no_aggregate_update() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator_valid = Address::generate(&env);
+        let creator_invalid = Address::generate(&env);
+
+        token_admin.mint(&sender, &1_000);
+
+        // Mix: valid entry (amount=100), then invalid entry (amount=0)
+        let mut tips: soroban_sdk::Vec<BatchTip> = soroban_sdk::Vec::new(&env);
+        tips.push_back(BatchTip {
+            creator: creator_valid.clone(),
+            token: token_id.clone(),
+            amount: 100,
+        });
+        tips.push_back(BatchTip {
+            creator: creator_invalid.clone(),
+            token: token_id.clone(),
+            amount: 0, // invalid — should not update aggregates
+        });
+
+        let results = client.tip_batch(&sender, &tips);
+        assert_eq!(results.get(0).unwrap(), Ok(()));
+        assert_eq!(results.get(1).unwrap(), Err(TipJarError::InvalidAmount));
+
+        // Valid creator has aggregate
+        let creators = client.get_top_creators(&TimePeriod::AllTime, &0, &10);
+        assert_eq!(creators.len(), 1);
+        assert_eq!(creators.get(0).unwrap().address, creator_valid);
+        assert_eq!(creators.get(0).unwrap().total_amount, 100);
+
+        // Invalid creator has no aggregate (not in participant list)
+        let tippers = client.get_top_tippers(&TimePeriod::AllTime, &0, &10);
+        assert_eq!(tippers.len(), 1); // only the sender from the valid entry
+        // Confirm the invalid creator is absent from creators list
+        let found_invalid = creators.iter().any(|e| e.address == creator_invalid);
+        assert!(!found_invalid, "failed entry's creator should not appear in leaderboard");
+    }
+
+    #[test]
+    fn test_leaderboard_tiebreaker_ordering() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+
+        // tipper_a: 1 tip of 100 → total_amount=100, tip_count=1
+        let tipper_a = Address::generate(&env);
+        token_admin.mint(&tipper_a, &1_000);
+        let creator_a = Address::generate(&env);
+        client.tip(&tipper_a, &creator_a, &token_id, &100);
+
+        // tipper_b: 2 tips of 50 each → total_amount=100, tip_count=2
+        let tipper_b = Address::generate(&env);
+        token_admin.mint(&tipper_b, &1_000);
+        let creator_b = Address::generate(&env);
+        client.tip(&tipper_b, &creator_b, &token_id, &50);
+        client.tip(&tipper_b, &creator_b, &token_id, &50);
+
+        let tippers = client.get_top_tippers(&TimePeriod::AllTime, &0, &10);
+        assert_eq!(tippers.len(), 2);
+
+        let first = tippers.get(0).unwrap();
+        let second = tippers.get(1).unwrap();
+
+        // Both have equal total_amount=100; tipper_b has higher tip_count=2 so comes first
+        assert_eq!(first.total_amount, 100);
+        assert_eq!(second.total_amount, 100);
+        assert!(
+            first.tip_count > second.tip_count,
+            "higher tip_count should rank first when total_amount is equal"
+        );
+        assert_eq!(first.address, tipper_b);
+        assert_eq!(second.address, tipper_a);
+    }
+
+    #[test]
+    fn test_leaderboard_zero_limit_returns_empty() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        token_admin.mint(&sender, &1_000);
+        client.tip(&sender, &creator, &token_id, &100);
+
+        let result = client.get_top_tippers(&TimePeriod::AllTime, &0, &0);
+        assert_eq!(result.len(), 0, "limit=0 should return empty vec");
+    }
+
+    #[test]
+    fn test_leaderboard_offset_past_end_returns_empty() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+
+        // Create 2 tippers
+        let sender_a = Address::generate(&env);
+        let sender_b = Address::generate(&env);
+        let creator = Address::generate(&env);
+        token_admin.mint(&sender_a, &1_000);
+        token_admin.mint(&sender_b, &1_000);
+        client.tip(&sender_a, &creator, &token_id, &100);
+        client.tip(&sender_b, &creator, &token_id, &200);
+
+        // offset=10 is past the 2 tippers
+        let result = client.get_top_tippers(&TimePeriod::AllTime, &10, &5);
+        assert_eq!(result.len(), 0, "offset past end should return empty vec");
+    }
+
+    #[test]
+    fn test_leaderboard_queries_available_while_paused() {
+        let (env, contract_id, token_id, _, admin) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+
+        token_admin.mint(&sender, &1_000);
+        client.tip(&sender, &creator, &token_id, &100);
+
+        // Pause the contract
+        client.pause(&admin);
+
+        // Queries must succeed without panic even while paused
+        let tippers = client.get_top_tippers(&TimePeriod::AllTime, &0, &10);
+        let creators = client.get_top_creators(&TimePeriod::AllTime, &0, &10);
+
+        assert_eq!(tippers.len(), 1, "get_top_tippers should work while paused");
+        assert_eq!(creators.len(), 1, "get_top_creators should work while paused");
     }
 }
