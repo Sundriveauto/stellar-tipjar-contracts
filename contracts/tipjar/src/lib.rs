@@ -72,6 +72,20 @@ pub enum ParticipantKind {
     Creator,
 }
 
+/// Query parameters for tip history retrieval.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TipHistoryQuery {
+    pub creator: Option<Address>,
+    pub sender: Option<Address>,
+    pub min_amount: Option<i128>,
+    pub max_amount: Option<i128>,
+    pub start_time: Option<u64>,
+    pub end_time: Option<u64>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
 /// Role enum for role-based access control.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -318,6 +332,137 @@ impl TipJarContract {
 
         env.events()
             .publish((symbol_short!("withdraw"), creator, token), amount);
+    }
+
+    /// Returns tip-with-message records matching the given query filters, sorted by
+    /// timestamp descending, with offset/limit pagination.
+    ///
+    /// When `query.creator` is `Some`, only that creator's messages are scanned.
+    /// When `None`, all known creators (from the AllTime leaderboard participant list) are scanned.
+    /// No auth required; available even when the contract is paused.
+    pub fn get_tip_history(env: Env, query: TipHistoryQuery) -> Vec<TipWithMessage> {
+        let limit = if query.limit == 0 || query.limit > 100 { 100 } else { query.limit };
+
+        // Collect all candidate records from relevant creator(s).
+        let mut all: Vec<TipWithMessage> = Vec::new(&env);
+
+        if let Some(ref creator) = query.creator {
+            collect_creator_messages(&env, creator, &mut all);
+        } else {
+            // Scan all known creators from the AllTime bucket participant list.
+            let participants: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::CreatorParticipants(0u32))
+                .unwrap_or_else(|| Vec::new(&env));
+            for creator in participants.iter() {
+                collect_creator_messages(&env, &creator, &mut all);
+            }
+        }
+
+        // Apply filters.
+        let mut filtered: Vec<TipWithMessage> = Vec::new(&env);
+        for record in all.iter() {
+            if let Some(ref sender) = query.sender {
+                if record.sender != *sender { continue; }
+            }
+            if let Some(min) = query.min_amount {
+                if record.amount < min { continue; }
+            }
+            if let Some(max) = query.max_amount {
+                if record.amount > max { continue; }
+            }
+            if let Some(start) = query.start_time {
+                if record.timestamp < start { continue; }
+            }
+            if let Some(end) = query.end_time {
+                if record.timestamp > end { continue; }
+            }
+            filtered.push_back(record);
+        }
+
+        // Sort descending by timestamp (selection sort — no_std compatible).
+        let n = filtered.len();
+        let mut i = 0u32;
+        while i < n {
+            let mut newest = i;
+            let mut j = i + 1;
+            while j < n {
+                if filtered.get(j).unwrap().timestamp > filtered.get(newest).unwrap().timestamp {
+                    newest = j;
+                }
+                j += 1;
+            }
+            if newest != i {
+                let a = filtered.get(i).unwrap();
+                let b = filtered.get(newest).unwrap();
+                filtered.set(i, b);
+                filtered.set(newest, a);
+            }
+            i += 1;
+        }
+
+        // Paginate.
+        let total = filtered.len();
+        if query.offset >= total {
+            return Vec::new(&env);
+        }
+        let end = {
+            let candidate = query.offset + limit;
+            if candidate > total { total } else { candidate }
+        };
+        let mut page: Vec<TipWithMessage> = Vec::new(&env);
+        let mut idx = query.offset;
+        while idx < end {
+            page.push_back(filtered.get(idx).unwrap());
+            idx += 1;
+        }
+        page
+    }
+
+    /// Returns tip-with-message records for a specific creator, sorted by timestamp
+    /// descending, limited to `limit` results (capped at 100).
+    ///
+    /// No auth required; available even when the contract is paused.
+    pub fn get_creator_tips(env: Env, creator: Address, limit: u32) -> Vec<TipWithMessage> {
+        let effective_limit = if limit == 0 || limit > 100 { 100 } else { limit };
+        let messages: Vec<TipWithMessage> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorMessages(creator))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Sort descending by timestamp.
+        let mut sorted = messages.clone();
+        let n = sorted.len();
+        let mut i = 0u32;
+        while i < n {
+            let mut newest = i;
+            let mut j = i + 1;
+            while j < n {
+                if sorted.get(j).unwrap().timestamp > sorted.get(newest).unwrap().timestamp {
+                    newest = j;
+                }
+                j += 1;
+            }
+            if newest != i {
+                let a = sorted.get(i).unwrap();
+                let b = sorted.get(newest).unwrap();
+                sorted.set(i, b);
+                sorted.set(newest, a);
+            }
+            i += 1;
+        }
+
+        // Return up to effective_limit records.
+        let end = if effective_limit > n { n } else { effective_limit };
+        let mut result: Vec<TipWithMessage> = Vec::new(&env);
+        let mut idx = 0u32;
+        while idx < end {
+            result.push_back(sorted.get(idx).unwrap());
+            idx += 1;
+        }
+        result
     }
 
     pub fn is_whitelisted(env: Env, token: Address) -> bool {
@@ -893,6 +1038,18 @@ fn ranked_page(
     }
 
     result
+}
+
+/// Appends all `TipWithMessage` records for `creator` into `out`.
+fn collect_creator_messages(env: &Env, creator: &Address, out: &mut Vec<TipWithMessage>) {
+    let messages: Vec<TipWithMessage> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CreatorMessages(creator.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    for m in messages.iter() {
+        out.push_back(m);
+    }
 }
 
 #[cfg(test)]
@@ -2173,5 +2330,261 @@ mod tests {
             client.try_get_locked_tip(&creator, &id2).unwrap_err().unwrap(),
             TipJarError::LockedTipNotFound.into()
         );
+    }
+
+    // ── Tip history query tests ───────────────────────────────────────────────
+
+    fn tip_msg(
+        env: &Env,
+        client: &TipJarContractClient,
+        token_id: &Address,
+        sender: &Address,
+        creator: &Address,
+        amount: i128,
+        ts: u64,
+    ) {
+        env.ledger().with_mut(|li| li.timestamp = ts);
+        client.tip_with_message(
+            sender,
+            creator,
+            token_id,
+            &amount,
+            &soroban_sdk::String::from_str(env, "msg"),
+            &soroban_sdk::Map::new(env),
+        );
+    }
+
+    #[test]
+    fn test_get_creator_tips_returns_sorted_descending() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+        token_admin.mint(&sender, &3_000);
+
+        tip_msg(&env, &client, &token_id, &sender, &creator, 100, 1000);
+        tip_msg(&env, &client, &token_id, &sender, &creator, 200, 3000);
+        tip_msg(&env, &client, &token_id, &sender, &creator, 300, 2000);
+
+        let result = client.get_creator_tips(&creator, &10);
+        assert_eq!(result.len(), 3);
+        // Sorted descending by timestamp: 3000, 2000, 1000
+        assert_eq!(result.get(0).unwrap().timestamp, 3000);
+        assert_eq!(result.get(1).unwrap().timestamp, 2000);
+        assert_eq!(result.get(2).unwrap().timestamp, 1000);
+    }
+
+    #[test]
+    fn test_get_creator_tips_limit() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+        token_admin.mint(&sender, &3_000);
+
+        tip_msg(&env, &client, &token_id, &sender, &creator, 100, 1000);
+        tip_msg(&env, &client, &token_id, &sender, &creator, 200, 2000);
+        tip_msg(&env, &client, &token_id, &sender, &creator, 300, 3000);
+
+        let result = client.get_creator_tips(&creator, &2);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get(0).unwrap().timestamp, 3000);
+        assert_eq!(result.get(1).unwrap().timestamp, 2000);
+    }
+
+    #[test]
+    fn test_get_creator_tips_no_messages_returns_empty() {
+        let (env, contract_id, _, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let creator = Address::generate(&env);
+        let result = client.get_creator_tips(&creator, &10);
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_get_tip_history_filter_by_sender() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender_a = Address::generate(&env);
+        let sender_b = Address::generate(&env);
+        let creator = Address::generate(&env);
+        token_admin.mint(&sender_a, &1_000);
+        token_admin.mint(&sender_b, &1_000);
+
+        tip_msg(&env, &client, &token_id, &sender_a, &creator, 100, 1000);
+        tip_msg(&env, &client, &token_id, &sender_b, &creator, 200, 2000);
+        tip_msg(&env, &client, &token_id, &sender_a, &creator, 300, 3000);
+
+        let query = TipHistoryQuery {
+            creator: Some(creator.clone()),
+            sender: Some(sender_a.clone()),
+            min_amount: None,
+            max_amount: None,
+            start_time: None,
+            end_time: None,
+            limit: 10,
+            offset: 0,
+        };
+        let result = client.get_tip_history(&query);
+        assert_eq!(result.len(), 2);
+        for r in result.iter() {
+            assert_eq!(r.sender, sender_a);
+        }
+    }
+
+    #[test]
+    fn test_get_tip_history_filter_by_amount_range() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+        token_admin.mint(&sender, &3_000);
+
+        tip_msg(&env, &client, &token_id, &sender, &creator, 50,  1000);
+        tip_msg(&env, &client, &token_id, &sender, &creator, 150, 2000);
+        tip_msg(&env, &client, &token_id, &sender, &creator, 300, 3000);
+
+        let query = TipHistoryQuery {
+            creator: Some(creator.clone()),
+            sender: None,
+            min_amount: Some(100),
+            max_amount: Some(200),
+            start_time: None,
+            end_time: None,
+            limit: 10,
+            offset: 0,
+        };
+        let result = client.get_tip_history(&query);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get(0).unwrap().amount, 150);
+    }
+
+    #[test]
+    fn test_get_tip_history_filter_by_time_range() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+        token_admin.mint(&sender, &3_000);
+
+        tip_msg(&env, &client, &token_id, &sender, &creator, 100, 1000);
+        tip_msg(&env, &client, &token_id, &sender, &creator, 200, 2000);
+        tip_msg(&env, &client, &token_id, &sender, &creator, 300, 5000);
+
+        let query = TipHistoryQuery {
+            creator: Some(creator.clone()),
+            sender: None,
+            min_amount: None,
+            max_amount: None,
+            start_time: Some(1500),
+            end_time: Some(4000),
+            limit: 10,
+            offset: 0,
+        };
+        let result = client.get_tip_history(&query);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get(0).unwrap().timestamp, 2000);
+    }
+
+    #[test]
+    fn test_get_tip_history_pagination() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+        token_admin.mint(&sender, &5_000);
+
+        // Insert 5 tips with distinct timestamps
+        for i in 1u64..=5 {
+            tip_msg(&env, &client, &token_id, &sender, &creator, (i * 100) as i128, i * 1000);
+        }
+
+        let query_p1 = TipHistoryQuery {
+            creator: Some(creator.clone()),
+            sender: None,
+            min_amount: None,
+            max_amount: None,
+            start_time: None,
+            end_time: None,
+            limit: 2,
+            offset: 0,
+        };
+        let page1 = client.get_tip_history(&query_p1);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.get(0).unwrap().timestamp, 5000); // newest first
+        assert_eq!(page1.get(1).unwrap().timestamp, 4000);
+
+        let query_p2 = TipHistoryQuery {
+            creator: Some(creator.clone()),
+            sender: None,
+            min_amount: None,
+            max_amount: None,
+            start_time: None,
+            end_time: None,
+            limit: 2,
+            offset: 2,
+        };
+        let page2 = client.get_tip_history(&query_p2);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2.get(0).unwrap().timestamp, 3000);
+        assert_eq!(page2.get(1).unwrap().timestamp, 2000);
+    }
+
+    #[test]
+    fn test_get_tip_history_offset_past_end_returns_empty() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator = Address::generate(&env);
+        token_admin.mint(&sender, &1_000);
+
+        tip_msg(&env, &client, &token_id, &sender, &creator, 100, 1000);
+
+        let query = TipHistoryQuery {
+            creator: Some(creator.clone()),
+            sender: None,
+            min_amount: None,
+            max_amount: None,
+            start_time: None,
+            end_time: None,
+            limit: 10,
+            offset: 99,
+        };
+        let result = client.get_tip_history(&query);
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_get_tip_history_no_creator_filter_scans_all() {
+        let (env, contract_id, token_id, _, _) = setup();
+        let client = TipJarContractClient::new(&env, &contract_id);
+        let token_admin = token::StellarAssetClient::new(&env, &token_id);
+        let sender = Address::generate(&env);
+        let creator_a = Address::generate(&env);
+        let creator_b = Address::generate(&env);
+        token_admin.mint(&sender, &3_000);
+
+        tip_msg(&env, &client, &token_id, &sender, &creator_a, 100, 1000);
+        tip_msg(&env, &client, &token_id, &sender, &creator_b, 200, 2000);
+
+        let query = TipHistoryQuery {
+            creator: None,
+            sender: None,
+            min_amount: None,
+            max_amount: None,
+            start_time: None,
+            end_time: None,
+            limit: 10,
+            offset: 0,
+        };
+        let result = client.get_tip_history(&query);
+        assert_eq!(result.len(), 2);
     }
 }
