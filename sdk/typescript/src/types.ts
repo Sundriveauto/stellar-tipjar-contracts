@@ -8,9 +8,11 @@ export interface SendTipParams {
 export interface TipResult {
   success: boolean;
   txHash: string;
+  ledger: number;
 }
 
 export interface WithdrawResult {
   success: boolean;
   txHash: string;
+  ledger: number;
 }
