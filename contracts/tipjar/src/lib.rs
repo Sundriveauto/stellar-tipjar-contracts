@@ -253,6 +253,73 @@ impl TipJarContract {
         conditions::evaluator::set_offchain_approval(&env, &condition_id, approved);
     }
 
+    /// Adds a token to the whitelist. Admin only.
+    pub fn add_token(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, TipJarError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::TokenWhitelist(token), &true);
+    }
+
+    /// Transfers `amount` of `token` from `sender` into escrow for `creator`.
+    ///
+    /// Emits `("tip", creator)` with data `(sender, amount)`.
+    pub fn tip(env: Env, sender: Address, creator: Address, token: Address, amount: i128) {
+        sender.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        let whitelisted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+        token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
+        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let new_bal: i128 = env.storage().instance().get(&bal_key).unwrap_or(0) + amount;
+        env.storage().instance().set(&bal_key, &new_bal);
+        let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
+        let new_tot: i128 = env.storage().instance().get(&tot_key).unwrap_or(0) + amount;
+        env.storage().instance().set(&tot_key, &new_tot);
+        env.events().publish((symbol_short!("tip"), creator.clone()), (sender, amount));
+    }
+
+    /// Withdraws the full escrowed balance for `creator` in `token`.
+    ///
+    /// Emits `("withdraw", creator)` with data `amount`.
+    pub fn withdraw(env: Env, creator: Address, token: Address) {
+        creator.require_auth();
+        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let amount: i128 = env.storage().instance().get(&bal_key).unwrap_or(0);
+        if amount == 0 {
+            panic_with_error!(&env, TipJarError::NothingToWithdraw);
+        }
+        env.storage().instance().set(&bal_key, &0i128);
+        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &creator, &amount);
+        env.events().publish((symbol_short!("withdraw"), creator.clone()), amount);
+    }
+
+    /// Returns the current withdrawable balance for `creator` in `token`.
+    pub fn get_withdrawable_balance(env: Env, creator: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CreatorBalance(creator, token))
+            .unwrap_or(0)
+    }
+
+    /// Returns the historical total tips received by `creator` in `token`.
+    pub fn get_total_tips(env: Env, creator: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CreatorTotal(creator, token))
+            .unwrap_or(0)
+    }
+
     /// Executes a token tip only if all provided conditions evaluate to true.
     ///
     /// Returns true when the transfer is executed and false when conditions fail.
