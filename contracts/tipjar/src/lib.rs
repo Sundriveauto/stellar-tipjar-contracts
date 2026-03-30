@@ -27,8 +27,8 @@ pub mod governance;
 // Staking and Rewards
 pub mod staking;
 
-// Flash loans
-pub mod flashloan;
+// Conditional tip execution
+pub mod conditions;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,8 +195,8 @@ pub enum DataKey {
     TipRecord(u64),
     /// Global tip counter for assigning tip IDs.
     TipCounter,
-    /// Reentrancy guard for flash loan execution.
-    FlashLoanGuard,
+    /// Off-chain oracle approval flag keyed by condition ID.
+    OffchainCondition(BytesN<32>),
 }
 
 #[contracterror]
@@ -224,9 +224,7 @@ pub enum TipJarError {
     DexNotConfigured = 19,
     NftNotConfigured = 20,
     SwapFailed = 21,
-    FlashLoanNotRepaid = 22,
-    FlashLoanReentrant = 23,
-    FlashLoanCallbackFailed = 24,
+    ConditionFailed = 22,
 }
 
 #[contract]
@@ -242,14 +240,48 @@ impl TipJarContract {
         env.storage().instance().put(&DataKey::Admin, &admin);
     }
 
-    /// Executes a flash loan and enforces repayment plus fee in a single transaction.
-    pub fn flash_loan(
+    /// Sets an off-chain condition flag that can later be referenced in
+    /// conditional tip execution.
+    pub fn set_offchain_condition(
         env: Env,
-        receiver: Address,
+        oracle: Address,
+        condition_id: BytesN<32>,
+        approved: bool,
+    ) {
+        oracle.require_auth();
+        conditions::evaluator::set_offchain_approval(&env, &condition_id, approved);
+    }
+
+    /// Executes a token tip only if all provided conditions evaluate to true.
+    ///
+    /// Returns true when the transfer is executed and false when conditions fail.
+    pub fn execute_conditional_tip(
+        env: Env,
+        sender: Address,
+        creator: Address,
         token: Address,
         amount: i128,
-        params: Bytes,
-    ) {
-        flashloan::flash_loan(&env, &receiver, &token, amount, &params);
+        condition_list: Vec<conditions::types::Condition>,
+    ) -> bool {
+        sender.require_auth();
+
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+
+        let is_valid = conditions::evaluator::evaluate_all(&env, &condition_list);
+        if !is_valid {
+            return false;
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&sender, &creator, &amount);
+
+        env.events().publish(
+            (symbol_short!("condtip"), sender.clone()),
+            (creator.clone(), token, amount),
+        );
+
+        true
     }
 }
