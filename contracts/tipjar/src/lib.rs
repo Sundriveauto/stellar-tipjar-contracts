@@ -31,6 +31,9 @@ pub mod staking;
 // Conditional tip execution
 pub mod conditions;
 
+// Dynamic fee adjustment
+pub mod fees;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TipWithMessage {
@@ -198,8 +201,8 @@ pub enum DataKey {
     TipCounter,
     /// Off-chain oracle approval flag keyed by condition ID.
     OffchainCondition(BytesN<32>),
-    /// Monotonically increasing contract version, incremented on each upgrade.
-    ContractVersion,
+    /// Most-recently computed dynamic fee in basis points.
+    CurrentFeeBps,
 }
 
 #[contracterror]
@@ -360,36 +363,69 @@ impl TipJarContract {
         true
     }
 
-    /// Upgrades the contract WASM to the bytecode identified by `new_wasm_hash`.
+    /// Returns the last dynamically computed fee in basis points.
     ///
-    /// Only the stored admin may call this. The version counter is incremented
-    /// and an `("upgrade", contract_address)` event is emitted.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
-        admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != stored_admin {
-            panic_with_error!(&env, TipJarError::UpgradeUnauthorized);
-        }
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
-        let v: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ContractVersion)
-            .unwrap_or(1u32);
+    /// Defaults to the base fee (100 bps = 1%) if no tip has been processed yet.
+    pub fn get_current_fee_bps(env: Env) -> u32 {
         env.storage()
             .instance()
-            .set(&DataKey::ContractVersion, &(v + 1));
-        env.events().publish(
-            (symbol_short!("upgrade"), env.current_contract_address()),
-            v + 1,
-        );
+            .get(&DataKey::CurrentFeeBps)
+            .unwrap_or(fees::calculator::BASE_FEE_BPS)
     }
 
-    /// Returns the current contract version (default `1` before any upgrade).
-    pub fn version(env: Env) -> u32 {
-        env.storage()
+    /// Like `tip`, but deducts a dynamic platform fee before crediting the creator.
+    ///
+    /// `congestion` is a `u32` mapped as: 0 = Low, 1 = Normal, 2 = High.
+    /// The fee is retained in the contract; the creator receives `amount - fee`.
+    ///
+    /// Emits `("tip", creator)` with data `(sender, net_amount)` and
+    /// `("fee", creator)` with data `(fee_amount, fee_bps)`.
+    pub fn tip_with_fee(
+        env: Env,
+        sender: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        congestion: u32,
+    ) {
+        sender.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, TipJarError::InvalidAmount);
+        }
+        let whitelisted: bool = env
+            .storage()
             .instance()
-            .get(&DataKey::ContractVersion)
-            .unwrap_or(1u32)
+            .get(&DataKey::TokenWhitelist(token.clone()))
+            .unwrap_or(false);
+        if !whitelisted {
+            panic_with_error!(&env, TipJarError::TokenNotWhitelisted);
+        }
+
+        let level = match congestion {
+            0 => fees::CongestionLevel::Low,
+            2 => fees::CongestionLevel::High,
+            _ => fees::CongestionLevel::Normal,
+        };
+        let (fee, fee_bps) = fees::compute_fee(&env, amount, level);
+        let net = amount - fee;
+
+        token::Client::new(&env, &token).transfer(
+            &sender,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        let new_bal: i128 = env.storage().instance().get(&bal_key).unwrap_or(0) + net;
+        env.storage().instance().set(&bal_key, &new_bal);
+
+        let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
+        let new_tot: i128 = env.storage().instance().get(&tot_key).unwrap_or(0) + net;
+        env.storage().instance().set(&tot_key, &new_tot);
+
+        env.events()
+            .publish((symbol_short!("tip"), creator.clone()), (sender, net));
+        env.events()
+            .publish((symbol_short!("fee"), creator.clone()), (fee, fee_bps));
     }
 }
