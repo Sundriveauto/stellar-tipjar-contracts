@@ -231,6 +231,8 @@ pub enum TipJarError {
     NftNotConfigured = 20,
     SwapFailed = 21,
     ConditionFailed = 22,
+    /// Caller is not the stored admin; upgrade rejected.
+    UpgradeUnauthorized = 23,
 }
 
 #[contract]
@@ -286,11 +288,15 @@ impl TipJarContract {
         }
         token::Client::new(&env, &token).transfer(&sender, &env.current_contract_address(), &amount);
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
-        let new_bal: i128 = env.storage().instance().get(&bal_key).unwrap_or(0) + amount;
-        env.storage().instance().set(&bal_key, &new_bal);
+        let existing_bal: i128 = env.storage().persistent().get(&bal_key)
+            .unwrap_or_else(|| env.storage().instance().get(&bal_key).unwrap_or(0));
+        let new_bal: i128 = existing_bal + amount;
+        env.storage().persistent().set(&bal_key, &new_bal);
         let tot_key = DataKey::CreatorTotal(creator.clone(), token.clone());
-        let new_tot: i128 = env.storage().instance().get(&tot_key).unwrap_or(0) + amount;
-        env.storage().instance().set(&tot_key, &new_tot);
+        let existing_tot: i128 = env.storage().persistent().get(&tot_key)
+            .unwrap_or_else(|| env.storage().instance().get(&tot_key).unwrap_or(0));
+        let new_tot: i128 = existing_tot + amount;
+        env.storage().persistent().set(&tot_key, &new_tot);
         env.events().publish((symbol_short!("tip"), creator.clone()), (sender, amount));
     }
 
@@ -300,29 +306,28 @@ impl TipJarContract {
     pub fn withdraw(env: Env, creator: Address, token: Address) {
         creator.require_auth();
         let bal_key = DataKey::CreatorBalance(creator.clone(), token.clone());
-        let amount: i128 = env.storage().instance().get(&bal_key).unwrap_or(0);
+        let amount: i128 = env.storage().persistent().get(&bal_key)
+            .unwrap_or_else(|| env.storage().instance().get(&bal_key).unwrap_or(0));
         if amount == 0 {
             panic_with_error!(&env, TipJarError::NothingToWithdraw);
         }
-        env.storage().instance().set(&bal_key, &0i128);
+        env.storage().persistent().set(&bal_key, &0i128);
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &creator, &amount);
         env.events().publish((symbol_short!("withdraw"), creator.clone()), amount);
     }
 
     /// Returns the current withdrawable balance for `creator` in `token`.
     pub fn get_withdrawable_balance(env: Env, creator: Address, token: Address) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::CreatorBalance(creator, token))
-            .unwrap_or(0)
+        let key = DataKey::CreatorBalance(creator.clone(), token.clone());
+        env.storage().persistent().get(&key)
+            .unwrap_or_else(|| env.storage().instance().get(&key).unwrap_or(0))
     }
 
     /// Returns the historical total tips received by `creator` in `token`.
     pub fn get_total_tips(env: Env, creator: Address, token: Address) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::CreatorTotal(creator, token))
-            .unwrap_or(0)
+        let key = DataKey::CreatorTotal(creator.clone(), token.clone());
+        env.storage().persistent().get(&key)
+            .unwrap_or_else(|| env.storage().instance().get(&key).unwrap_or(0))
     }
 
     /// Executes a token tip only if all provided conditions evaluate to true.
